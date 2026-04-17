@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Digital Twin 3D - Suspension System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0d0d0d; font-family: 'Courier New', monospace; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #hud {
+            position: absolute; top: 15px; left: 15px; color: #00FF00;
+            background: rgba(0, 0, 0, 0.7); padding: 15px; border: 1px solid #00FF00; 
+            border-radius: 5px; box-shadow: 0 0 10px #00FF00; pointer-events: none; z-index: 1000;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+    <div id="hud">
+        <strong style="color:#fff">DIGITAL TWIN 3D ENGINE</strong><br>
+        STATUS: <span style="color:#0f0">ONLINE</span><br>
+        MODE: LIVE TELEMETRY<br>
+        Y-DISP: <span id="disp_hud">0.000</span> m
+    </div>
+
+    <script>
+        // --- DATA INJECTION (Se llena desde Python/Backend) ---
+        const BUMPS = __BUMPS_DATA__;        // Array de objetos [{s: start, e: end}, ...]
+        const globalStart = __START_SYNC_MS__;
+        const P = __SIM_PARAMS__;
+        const _m = P.m, _k = P.k, _b = P.b;   
+        const _CAR_MODEL_B64_ = "__CAR_MODEL_B64__"; // Base64 del modelo
+
+        let currentDisp = 0;
+        let absoluteT = 0;
+        let currentT = 0;
+        const SPEED = 25; // Velocidad visual del suelo
+
+        // Physics Engine JS nativo (100% Sincronizado a Gráfica)
+        let sim_x = 0, sim_v = 0, sim_t = 0;
+        const sim_dt = 0.005;
+        let bumpIdx = 0;
+        let lastBumpDetected = -1;
+        window.sim_broken = false; // Empezar sano, se rompe dinámicamente si x > 0.4
+
+        // --- AUDIO ENGINE ---
+        let audioCtx = null;
+        let engineOsc, engineFilter, engineGain, lfoPistons;
+        let isAudioInitialized = false;
+
+        function initAudio() {
+            if (isAudioInitialized) return;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // --- CONTINUOUS ENGINE SOUND (BRUM BRUM RÁPIDO) ---
+                // Tono base ronco y grave
+                engineOsc = audioCtx.createOscillator();
+                engineOsc.type = 'sawtooth'; 
+                engineOsc.frequency.value = 65; 
+                
+                // Oscilador LFO para crear el pulso "brum-brum-brum"
+                lfoPistons = audioCtx.createOscillator();
+                lfoPistons.type = 'sine';
+                lfoPistons.frequency.value = 15; // Velocidad del brum-brum (un poquito rápida)
+                
+                // Ganancia que será modulada por el LFO
+                const amGain = audioCtx.createGain();
+                amGain.gain.value = 0.4; // Volumen base
+                
+                const lfoDepth = audioCtx.createGain();
+                lfoDepth.gain.value = 0.4; // Profundidad del efecto "brum"
+                
+                // Conectar el LFO a la ganancia para crear el ritmo
+                lfoPistons.connect(lfoDepth);
+                lfoDepth.connect(amGain.gain);
+
+                // Filtro para quitar lo "chillón" y dejar el ronroneo
+                engineFilter = audioCtx.createBiquadFilter();
+                engineFilter.type = 'lowpass'; 
+                engineFilter.frequency.value = 250; 
+                engineFilter.Q.value = 1.0; 
+                
+                // Control maestro de nivel (volumen más bajo y agradable)
+                engineGain = audioCtx.createGain();
+                engineGain.gain.value = 3.5; 
+                
+                // Conexiones
+                engineOsc.connect(amGain);
+                amGain.connect(engineFilter);
+                engineFilter.connect(engineGain);
+                engineGain.connect(audioCtx.destination);
+                
+                engineOsc.start();
+                lfoPistons.start();
+                isAudioInitialized = true;
+            } catch(e) {
+                console.log("Audio no soportado");
+            }
+        }
+
+        function playBumpSound() {
+            if (!isAudioInitialized || !audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            
+            // "Thump" / Crash sound
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(150, audioCtx.currentTime); // Start low pitch
+            osc.frequency.exponentialRampToValueAtTime(10, audioCtx.currentTime + 0.2); // Drop pitch quickly
+            
+            gain.gain.setValueAtTime(1.0, audioCtx.currentTime); // Max volume
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2); // Decay volume quickly
+            
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.2);
+
+            // --- REDUCCIÓN DE VELOCIDAD DEL MOTOR (FRENADO) ---
+            if (engineOsc && lfoPistons) {
+                const now = audioCtx.currentTime;
+                
+                // 1. Cancelar cualquier aceleración previa que estuviera en curso
+                engineOsc.frequency.cancelScheduledValues(now);
+                lfoPistons.frequency.cancelScheduledValues(now);
+                
+                // 2. Caer bruscamente las RPM simulando el frenazo tras golpear el bache
+                engineOsc.frequency.setValueAtTime(40, now); // El tono cae en picada (menos revoluciones)
+                lfoPistons.frequency.setValueAtTime(6, now); // El ritmo "brum-brum" se vuelve muy lento (6 pulsos/seg)
+                
+                // 3. Acelerar progresivamente de nuevo durante 2.5 segundos para recuperar la velocidad crucero
+                engineOsc.frequency.exponentialRampToValueAtTime(65, now + 2.5); // Vuelve al tono normal
+                lfoPistons.frequency.linearRampToValueAtTime(15, now + 2.5);     // Vuelve al ritmo rápido de 15 pulsos/seg
+            }
+        }
+
+        // Inicializar el audio automáticamente (Sin requerir un clic en esta pestaña)
+        // Nota: Muchos navegadores desbloquean el audio si el usuario ya movió
+        // un slider o dio un clic en Streamlit antes de cargar este iframe.
+        setTimeout(() => {
+            initAudio();
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(e => console.warn("Navegador bloqueó el autoplay", e));
+            }
+        }, 300); // 300ms de gracia para que cargue el WebGL primero
+
+        // Mantenemos el fallback por si el usuario abre la página directo sin interactuar
+        window.addEventListener('click', () => {
+            if (!isAudioInitialized) initAudio();
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        });
+
+        function getDispRealTime(targetT) {
+            while(sim_t < targetT) {
+                if (window.sim_broken) {
+                    // Cae al suelo de manera rígida y no rebota más (gravedad comprime el resorte al máximo)
+                    sim_v += 9.81 * sim_dt; // Gravedad comprime (positivo hacia abajo en nuestro chY)
+                    sim_x += sim_v * sim_dt;
+                    if (sim_x > 0.33) {
+                        sim_x = 0.33;
+                        sim_v = 0.0;
+                    }
+                    sim_t += sim_dt;
+                    continue;
+                }
+
+                let force = 0;
+                while(bumpIdx < BUMPS.length && BUMPS[bumpIdx].e < sim_t) bumpIdx++;
+                if (bumpIdx < BUMPS.length && sim_t >= BUMPS[bumpIdx].s && sim_t <= BUMPS[bumpIdx].e) {
+                    force = 50.0 * 0.15;
+                    
+                    // Reproducir sonido solo en el instante en que tocamos el bache
+                    if (lastBumpDetected !== bumpIdx) {
+                        playBumpSound();
+                        lastBumpDetected = bumpIdx;
+                    }
+                }
+                let acc = (force - _b * sim_v - _k * sim_x) / _m;
+                sim_v += acc * sim_dt;
+                sim_x += sim_v * sim_dt;
+
+                // Detección de daño/ruptura
+                if (Math.abs(sim_x) > 0.4 && !window.sim_broken) {
+                    window.sim_broken = true;
+                    // Al romperse suena (reusa el sonido fuerte como crujido)
+                    playBumpSound(); 
+                }
+
+                // Dureza del resorte previa ruptura
+                if (sim_x > 0.45) { sim_x = 0.45; sim_v *= -0.2; }
+                if (sim_x < -0.45) { sim_x = -0.45; sim_v *= -0.2; }
+
+                sim_t += sim_dt;
+            }
+            return sim_x;
+        }
+        
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x0d0d0d, 0.015);
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(-15, 8, 20); 
+        camera.lookAt(0, 2, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        
+        // PBR Material Support (Colores Originales del GLB)
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        
+        document.body.appendChild(renderer.domElement);
+
+        // Iluminación cinemática (Luces Blancas para no teñir de verde/cyan el modelo)
+        scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+        const spotLight = new THREE.SpotLight(0xffffff, 2.5);
+        spotLight.position.set(10, 30, 20); spotLight.castShadow = true;
+        scene.add(spotLight);
+        const fillLight = new THREE.DirectionalLight(0xffffff, 1.0); 
+        fillLight.position.set(-20, 10, -20); scene.add(fillLight);
+
+        // --- SUELO CON TEXTURA DE GRAVA + MOVIMIENTO INFINITO ---
+const textureLoader = new THREE.TextureLoader();
+
+const gravelTexture = textureLoader.load('textures/gravel.jpg'); // 👈 CAMBIA ESTA RUTA
+
+gravelTexture.wrapS = THREE.RepeatWrapping;
+gravelTexture.wrapT = THREE.RepeatWrapping;
+
+// Ajusta según tamaño del plano
+gravelTexture.repeat.set(80, 40);
+
+const floorGeo = new THREE.PlaneGeometry(800, 200, 1, 1);
+
+const floorMat = new THREE.MeshStandardMaterial({
+    map: gravelTexture,
+    roughness: 1,
+    metalness: 0
+});
+
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+        
+        // Líneas divisoras de carril automáticas (usamos grid como hack visual rápido)
+        const grid = new THREE.GridHelper(800, 200, 0x050505, 0x050505); 
+        grid.position.y = 0.05; 
+        scene.add(grid);
+
+        // --- ENTORNO DE CIUDAD PROCEDURAL (ALTO RENDIMIENTO) ---
+        const cityGroup = new THREE.Group();
+        scene.add(cityGroup);
+        
+        const cityLength = 400; // Largo antes de loopear
+        
+        const dummy = new THREE.Object3D();
+        const colorObj = new THREE.Color();
+
+        // 0. Carretera y Líneas Blancas Centrales
+        const roadGeo = new THREE.PlaneGeometry(800, 16);
+        const roadMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 });
+        const roadMesh = new THREE.Mesh(roadGeo, roadMat);
+        roadMesh.rotation.x = -Math.PI / 2;
+        roadMesh.position.y = 0.08;
+        roadMesh.receiveShadow = true;
+        scene.add(roadMesh);
+
+        const lineGeo = new THREE.PlaneGeometry(4, 0.4);
+        const lineMat = new THREE.MeshBasicMaterial({ color: 0xeeeeee });
+        const instancedLines = new THREE.InstancedMesh(lineGeo, lineMat, 40 * 2);
+        for(let i=0; i<40; i++) {
+            let xPos = (i * (cityLength / 40));
+            dummy.position.set(xPos, 0.1, 0); 
+            dummy.rotation.set(-Math.PI/2, 0, 0);
+            dummy.scale.set(1, 1, 1);
+            dummy.updateMatrix();
+            instancedLines.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 0.1, 0);
+            dummy.updateMatrix();
+            instancedLines.setMatrixAt(i+40, dummy.matrix);
+        }
+        instancedLines.instanceMatrix.needsUpdate = true;
+        cityGroup.add(instancedLines);
+
+        // 1. Edificios (Solo por detrás: Z negativo lejano)
+        // Textura procedural liviana para simular ventanas iluminadas
+        const winCanvas = document.createElement('canvas');
+        winCanvas.width = 256; winCanvas.height = 256;
+        const ctx = winCanvas.getContext('2d');
+        ctx.fillStyle = '#0f1724'; ctx.fillRect(0, 0, 256, 256);
+        for(let x=12; x<256; x+=24) {
+            for(let y=12; y<256; y+=28) {
+                if(Math.random() > 0.6) {
+                    ctx.fillStyle = (Math.random() > 0.3) ? '#ffcc00' : '#ffffff';
+                    ctx.fillRect(x, y, 12, 16);
+                } 
+            }
+        }
+        const winTex = new THREE.CanvasTexture(winCanvas);
+        winTex.wrapS = THREE.RepeatWrapping; winTex.wrapT = THREE.RepeatWrapping;
+        winTex.repeat.set(3, 8); // Repetir patrón en cada edificio
+
+        const numBuildings = 60;
+        const bldgGeo = new THREE.BoxGeometry(1, 1, 1);
+        const bldgMat = new THREE.MeshStandardMaterial({ roughness: 0.7, metalness: 0.3, map: winTex });
+        const instancedBuildings = new THREE.InstancedMesh(bldgGeo, bldgMat, numBuildings * 2);
+        instancedBuildings.castShadow = true;
+        instancedBuildings.receiveShadow = true;
+
+        for (let i = 0; i < numBuildings; i++) {
+            let xPos = (Math.random() * cityLength);
+            // La cámara está en Z=20 mirando al auto (Z=0). 
+            // Ponemos los edificios en Z = -35 a -100 para que pasen detrás del auto
+            let zPos = -(35 + Math.random() * 65); 
+            
+            let w = 15 + Math.random() * 20;
+            let d = 15 + Math.random() * 20;
+            let h = 40 + Math.random() * 90;
+            
+            // Variación de color nocturno
+            let baseColor = new THREE.Color(0x3a4b66);
+            baseColor.lerp(new THREE.Color(0x151c27), Math.random() * 0.8);
+            
+            // Original
+            dummy.position.set(xPos, h/2, zPos);
+            dummy.rotation.set(0, 0, 0);
+            dummy.scale.set(w, h, d);
+            dummy.updateMatrix();
+            instancedBuildings.setMatrixAt(i, dummy.matrix);
+            instancedBuildings.setColorAt(i, baseColor);
+            
+            // Clon para el loop
+            dummy.position.set(xPos + cityLength, h/2, zPos);
+            dummy.updateMatrix();
+            instancedBuildings.setMatrixAt(i + numBuildings, dummy.matrix);
+            instancedBuildings.setColorAt(i + numBuildings, baseColor);
+        }
+        instancedBuildings.instanceMatrix.needsUpdate = true;
+        if(instancedBuildings.instanceColor) instancedBuildings.instanceColor.needsUpdate = true;
+        cityGroup.add(instancedBuildings);
+
+        // 2. Farolas Realistas y Árboles (Solo a los costados traseros)
+        const numPoles = 25;
+        // Farolas
+        const poleGeo = new THREE.CylinderGeometry(0.1, 0.15, 12, 8);
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0x555555, metalness: 0.8, roughness: 0.3 });
+        const instancedPoles = new THREE.InstancedMesh(poleGeo, poleMat, numPoles * 2);
+        
+        const lightGeo = new THREE.BoxGeometry(1.5, 0.2, 0.5);
+        const lightMat = new THREE.MeshBasicMaterial({ color: 0xffeebb }); 
+        const instancedLights = new THREE.InstancedMesh(lightGeo, lightMat, numPoles * 2);
+
+        // Árboles (Pinos 3D con Conos y Tronco)
+        const numTrees = 45;
+        const trunkGeo = new THREE.CylinderGeometry(0.3, 0.4, 2.5, 6);
+        const trunkMat = new THREE.MeshStandardMaterial({ color: 0x3b2818, roughness: 0.9 });
+        const instancedTrunks = new THREE.InstancedMesh(trunkGeo, trunkMat, numTrees * 2);
+        
+        const leavesGeo = new THREE.ConeGeometry(2, 5, 8);
+        const leavesMat = new THREE.MeshStandardMaterial({ color: 0x0B1A0B, roughness: 0.9 }); // Verde aún más oscuro
+        const instancedLeaves1 = new THREE.InstancedMesh(leavesGeo, leavesMat, numTrees * 2);
+        const instancedLeaves2 = new THREE.InstancedMesh(leavesGeo, leavesMat, numTrees * 2);
+
+        // Generar Farolas
+        for (let i = 0; i < numPoles; i++) {
+            let xPos = (i * (cityLength / numPoles)); 
+            let zPos = -10; // Borde superior de la carretera (fondo)
+            dummy.scale.set(1,1,1);
+            dummy.rotation.set(0,0,0);
+            
+            // Poste
+            dummy.position.set(xPos, 6, zPos);
+            dummy.updateMatrix();
+            instancedPoles.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 6, zPos);
+            dummy.updateMatrix();
+            instancedPoles.setMatrixAt(i + numPoles, dummy.matrix);
+            
+            // Lámpara extendida hacia la carretera
+            dummy.position.set(xPos, 12, zPos + 1);
+            dummy.updateMatrix();
+            instancedLights.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 12, zPos + 1);
+            dummy.updateMatrix();
+            instancedLights.setMatrixAt(i + numPoles, dummy.matrix);
+        }
+
+        // Generar Pinos
+        for (let i = 0; i < numTrees; i++) {
+            let xPos = (Math.random() * cityLength); 
+            let zPos = -(12 + Math.random() * 15); // Detrás de las farolas, antes de edificios
+            let s = 0.8 + Math.random() * 0.6; // Escala random
+            
+            dummy.rotation.set(0,0,0);
+            
+            // Tronco
+            dummy.position.set(xPos, 1.25 * s, zPos);
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            instancedTrunks.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 1.25 * s, zPos);
+            dummy.updateMatrix();
+            instancedTrunks.setMatrixAt(i + numTrees, dummy.matrix);
+
+            // Capa hojas 1
+            dummy.position.set(xPos, 3.5 * s, zPos);
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            instancedLeaves1.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 3.5 * s, zPos);
+            dummy.updateMatrix();
+            instancedLeaves1.setMatrixAt(i + numTrees, dummy.matrix);
+
+            // Capa hojas 2 (Copa más alta e insertada)
+            dummy.position.set(xPos, 6.0 * s, zPos);
+            dummy.scale.set(s*0.8, s*0.9, s*0.8);
+            dummy.updateMatrix();
+            instancedLeaves2.setMatrixAt(i, dummy.matrix);
+            dummy.position.set(xPos + cityLength, 6.0 * s, zPos);
+            dummy.updateMatrix();
+            instancedLeaves2.setMatrixAt(i + numTrees, dummy.matrix);
+        }
+
+        instancedPoles.instanceMatrix.needsUpdate = true;
+        instancedLights.instanceMatrix.needsUpdate = true;
+        instancedTrunks.instanceMatrix.needsUpdate = true;
+        instancedLeaves1.instanceMatrix.needsUpdate = true;
+        instancedLeaves2.instanceMatrix.needsUpdate = true;
+        
+        cityGroup.add(instancedPoles);
+        cityGroup.add(instancedLights);
+        cityGroup.add(instancedTrunks);
+        cityGroup.add(instancedLeaves1);
+        cityGroup.add(instancedLeaves2);
+
+        // 3. Ajuste de ambiente (Noche)
+        scene.background = new THREE.Color(0x050810);
+        scene.fog = new THREE.FogExp2(0x050810, 0.008); // Niebla oscura que oculta el horizonte
+
+        // --- CAR MODEL ---
+        const carGroup = new THREE.Group(); 
+        scene.add(carGroup);
+
+        const chassisObj = new THREE.Group(); // Agrupa todo el chasis para moverlo junto
+        carGroup.add(chassisObj);
+
+        // Variables para las ruedas del modelo .glb
+        let realWheels = []; 
+        let glbScale = 6.5; // Guardará la escala global para adaptar la física de las llantas
+
+        // Variables genericas
+        let wheels = []; 
+        let springs = [];
+        let bumpMeshes = [];
+        
+
+        // --- Textura de cebra amarillo y negro para los bumps ---
+        const bumpCanvas = document.createElement('canvas');
+        bumpCanvas.width = 64; bumpCanvas.height = 64;
+        const bumpCtx = bumpCanvas.getContext('2d');
+        const stripes = 8; // cantidad de franjas
+const stripeWidth = bumpCanvas.width / stripes;
+
+for (let i = 0; i < stripes; i++) {
+    bumpCtx.fillStyle = (i % 2 === 0) ? '#ffff00' : '#000000';
+    bumpCtx.fillRect(i * stripeWidth, 0, stripeWidth, bumpCanvas.height);
+}
+        const bumpTex = new THREE.CanvasTexture(bumpCanvas);
+        bumpTex.wrapS = THREE.RepeatWrapping;
+        bumpTex.wrapT = THREE.RepeatWrapping;
+        bumpTex.repeat.set(4, 1);
+        bumpTex.rotation = Math.PI / 2;
+        bumpTex.center.set(0.5, 0.5);
+        const globalBumpGeo = new THREE.CylinderGeometry(0.6, 0.6, 15, 32);
+        const globalBumpMat = new THREE.MeshStandardMaterial({
+    map: bumpTex,
+    roughness: 0.3,
+    metalness: 0.2,
+    emissive: 0x222200,
+    emissiveIntensity: 0.6
+});
+        class HelixCurve extends THREE.Curve {
+            constructor(r, c, h) { super(); this.r=r; this.c=c; this.h=h; }
+            getPoint(t, opt) { const a=t*Math.PI*2*this.c; return (opt||new THREE.Vector3()).set(Math.cos(a)*this.r, t*this.h, Math.sin(a)*this.r); }
+        }
+
+        if (_CAR_MODEL_B64_ && _CAR_MODEL_B64_.length > 10) {
+            // Decodificar Base64 a ArrayBuffer nativamente
+            const binaryString = window.atob(_CAR_MODEL_B64_);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            const loader = new THREE.GLTFLoader();
+            loader.parse(bytes.buffer, '', function(gltf) {
+                const model = gltf.scene;
+                
+                // Auto-escalado inteligente basado en las dimensiones reales del modelo
+                const box = new THREE.Box3().setFromObject(model);
+                const size = new THREE.Vector3();
+                box.getSize(size);
+                
+                // Encontrar cuál es la dimensión más larga (usualmente la longitud de punta a cola)
+                const maxDim = Math.max(size.x, size.y, size.z);
+                
+                // Nuestro carro amarillo original mide aproximadamente 11 unidades de largo
+                let targetSize = 11.0;
+                let scaleF = targetSize / maxDim;
+                
+                // Validar que el valor de escala sea correcto por seguridad
+                if (!isFinite(scaleF) || scaleF <= 0) scaleF = 6.5; 
+                glbScale = scaleF;
+
+                // Ajustar al tamaño y rotación del escenario
+                model.scale.set(glbScale, glbScale, glbScale);
+                model.rotation.y = Math.PI / 2; // Apuntar hacia adelante correctamente (Reversa arreglada)
+                
+                // Activar sombras en todo el modelo primero
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                // Encontrar grupos completos de llantas (agrupando neumático oscuro y rin brillante)
+                let tempWheels = [];
+                model.traverse((child) => {
+                    const name = child.name.toLowerCase();
+                    if ((name.includes('wheel') || name.includes('tire') || name.includes('rim') || name.includes('rueda')) && !name.includes('suspension')) {
+                        // Si un nodo padre ya fue catalogado como rueda, omitimos sus hijos para evitar fragmentarlos
+                        let isInsideWheel = false;
+                        child.traverseAncestors(p => { if(tempWheels.includes(p)) isInsideWheel = true; });
+                        
+                        if (!isInsideWheel) tempWheels.push(child);
+                    }
+                });
+
+                // Añadimos el carro al objeto que rebotará
+                chassisObj.add(model);
+
+                // Forzar sincronización matricial del escenario
+                model.updateMatrixWorld(true);
+                
+                // 1. Alineación Perfecta de la Goma al Suelo (Ignorando fallos ocultos de modelado en la carrocería)
+                let wheelsLowestY = Infinity;
+                tempWheels.forEach(w => {
+                    const b = new THREE.Box3().setFromObject(w);
+                    if (b.min.y < wheelsLowestY) wheelsLowestY = b.min.y;
+                });
+                
+                if (wheelsLowestY !== Infinity) {
+                    model.position.y -= wheelsLowestY; // Alineamos matemáticamente LAS LLANTAS, el carro las seguirá.
+                } else {
+                    const fullCarBox = new THREE.Box3().setFromObject(model);
+                    model.position.y -= fullCarBox.min.y; 
+                }
+
+                model.updateMatrixWorld(true); 
+                carGroup.updateMatrixWorld(true);
+                chassisObj.updateMatrixWorld(true);
+
+                // 2. Extraer las llantas al espacio global (asfalto inamovible)
+                tempWheels.forEach(wNode => {
+                    const wBox = new THREE.Box3().setFromObject(wNode);
+                    const realCenterWorld = new THREE.Vector3();
+                    wBox.getCenter(realCenterWorld);
+                    const wRadius = (wBox.max.y - wBox.min.y) / 2; // Calcular exactamente de qué radio es la rueda
+                    
+                    const pivotGroup = new THREE.Group();
+                    pivotGroup.position.copy(carGroup.worldToLocal(realCenterWorld.clone()));
+                    
+                    carGroup.add(pivotGroup);
+                    pivotGroup.attach(wNode); // Remueve la llanta del chasis reteniendo el 100% de posición y escala
+                    
+                    pivotGroup.userData.baseY = pivotGroup.position.y;
+                    pivotGroup.userData.radius = wRadius; // Guardar el radio para anclar suspensión
+                    realWheels.push(pivotGroup); 
+                });
+
+            }, function (error) {
+                console.error("Error cargando .glb:", error);
+            });
+            
+            // Dummy Wheels Data para que el script no rompa abajo
+            if (Array.isArray(BUMPS)) {
+                BUMPS.forEach(b => {
+                    const bM = new THREE.Mesh(globalBumpGeo, globalBumpMat); 
+                    bM.rotation.x = Math.PI/2; 
+                    bM.position.y = -0.1; 
+                    bM.castShadow = true;
+                    scene.add(bM); 
+                    bumpMeshes.push({ m: bM, s: b.s, e: b.e });
+                });
+            }
+        } else {
+            console.warn("No se cargó el modelo GLB en base64, usando placeholders o fallando graciosamente.");
+            // Aquí iría el código fallback para cargar un carro dummy...
+            if (Array.isArray(BUMPS)) {
+                BUMPS.forEach(b => {
+                    const bM = new THREE.Mesh(globalBumpGeo, globalBumpMat); 
+                    bM.rotation.x = Math.PI/2; 
+                    bM.position.y = -0.1; 
+                    bM.castShadow = true;
+                    scene.add(bM); 
+                    bumpMeshes.push({ m: bM, s: b.s, e: b.e });
+                });
+            }
+        }
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Permitir auto-reanudación si el contexto de audio se crea pero el navegador
+            // lo pausa hasta que el usuario interactúa superficialmente con la página global.
+            if (!isAudioInitialized) {
+                try { initAudio(); } catch(e) {}
+            }
+            if (isAudioInitialized && audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(e => {}); // Fuerza bruta silenciosa hasta que el navegador ceda y suelte el sonido
+            }
+
+            // 1. Sincronización ABSOLUTA con Física Javascript
+            let now = Date.now();
+            absoluteT = Math.max(0, (now - globalStart) / 1000);
+            currentDisp = getDispRealTime(absoluteT);
+            currentT = absoluteT; // Reloj continuo real
+            
+            // Actualizar HUD
+            document.getElementById('disp_hud').innerText = currentDisp.toFixed(4);
+            
+            // 2. Movimiento del Chasis (Respuesta a la suspensión)
+            // `currentDisp` de Python provee el nivel de hundimiento (ej. oscila).
+            // Lo amplificamos un poco para mostrar el amortiguador (por ejemplo, x 5.0) y guardamos que Y positivo es hacia abajo.
+            let chY = -(currentDisp * 5.0); 
+
+            // Hard Stop de Chasis (Collision Check)
+            // Para asegurar que la carrocería en ningún mundo baje debajo del suelo de asfalto gris o se meta en las llantas,
+            // validamos que no baje más que el límite equivalente a la carrocería sobre la llanta.
+            // Extraemos este límite del primer modelo GLB válido (ej: la rueda baja). 
+            let maxCida = -1.5; 
+            if (chY < maxCida) chY = maxCida; 
+
+            // Calcular cuánto nos sube el bache físicamente en este preciso instante
+            let currentBumpLift = 0;
+            bumpMeshes.forEach(b => {
+                if (absoluteT >= b.s && absoluteT <= b.e) { 
+                    const progress = (absoluteT - b.s) / (b.e - b.s);
+                    currentBumpLift += 0.9 * Math.sin(Math.PI * progress); 
+                }
+            });
+
+            if (window.sim_broken) {
+                // Si el amortiguador está roto (rígido), el chasis ya no absorbe nada.
+                // Sube exactamente lo mismo que la llanta pasa por encima del bache.
+                chY += currentBumpLift;
+            }
+
+            chassisObj.position.y = chY; // Movemos la carrocería exclusivamente
+            
+            // 3. Efecto de Avance (Suelo, Ciudad y Baches)
+            grid.position.x = -(absoluteT * SPEED) % 15;
+            cityGroup.position.x = -(absoluteT * SPEED) % cityLength;
+
+            // Movimiento infinito de la textura del suelo
+gravelTexture.offset.x -= SPEED * 0.0005;
+            
+            // Desplaza visualmente cada bache hacia el coche en INFINITO real
+            bumpMeshes.forEach(b => { 
+                let bPos = 3.5 - ((absoluteT - b.s) * SPEED); 
+                b.m.position.x = bPos; 
+                // Ocultar si está demasiado lejos (Optimización de rendimiento para 1 hora de baches)
+                b.m.visible = (bPos > -50 && bPos < 50);
+            });
+
+            // 4. Animación de Llantas y Resortes
+            wheels.forEach((wData, i) => {
+                const w = wData.group;
+                const rolling = wData.rolling;
+                
+                // Rotación de la llanta (gira perpendicularmente al avance del auto)
+                if (rolling) {
+                    rolling.rotation.x -= SPEED * 0.05; 
+                    // Usamos rotation.x girando en negativo para que la rueda ruede hacia adelante
+                    rolling.rotation.x -= 0.15;
+                }
+                
+                let wy = 1.0; // Altura base de la llanta (wheelRadius aprox)
+                
+                // Aplicar subida igual para todas las llantas
+                wy += currentBumpLift;
+                w.position.y = wy;
+                
+                // 5. Compresión del resorte
+                // Se calcula por la distancia entre el chasis y la llanta
+                if (springs && springs[i]) {
+                    const sp = springs[i]; 
+                    sp.position.y = w.position.y; 
+                    // Escalamos el tubo de la geometría para que parezca que se comprime
+                    sp.scale.y = Math.max(0.1, (chY - 0.5 - w.position.y) / 2.5);
+                }
+            });
+
+            // Rotar ruedas del GLB externo
+            if (typeof realWheels !== 'undefined' && realWheels.length > 0) {
+                realWheels.forEach(w => {
+                    // Ahora que centramos el pivote, el eje para rodar hacia el frente (dirección X) debe ser Z.
+                    w.rotation.z -= SPEED * 0.05; 
+                    
+                    let wy = w.userData.baseY; // Recuperar la altura del suelo de cada modelo de llanta
+                    
+                    // La llanta sube junto con el bache en todo momento. Su altura es idéntica a currentBumpLift
+                    wy += currentBumpLift;
+                    
+                    // La llanta conserva su nivel del suelo base + la subida en el bache. Al estar fuera del chasis, jamás se hundirá bajo la cuadrícula de asfalto gris Y=0.
+                    w.position.y = wy; 
+                });
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // Responsive
+        window.addEventListener('resize', () => { 
+            camera.aspect = window.innerWidth / window.innerHeight; 
+            camera.updateProjectionMatrix(); 
+            renderer.setSize(window.innerWidth, window.innerHeight); 
+        });
+    </script>
+</body>
+</html>
