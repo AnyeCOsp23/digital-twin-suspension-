@@ -1,8 +1,5 @@
 # 🚗 Gemelo Digital: Sistema de Suspensión Masa-Resorte-Amortiguador
 
-<p align="center">
-  <img src="assets/suspension_diagram.png" alt="Diagrama Masa-Resorte-Amortiguador" width="400"/>
-</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
@@ -79,10 +76,12 @@ m·x''(t) + b·x'(t) + k·x(t) = F(t)
 ---
 
 ## 🗂️ Estructura del Proyecto
+
+```
 digital-twin-suspension/
 ├── app.py                    # Dashboard principal (Streamlit)
 ├── backend/
-│   ├── init.py
+│   ├── __init__.py
 │   ├── physics.py            # Motor de física con SciPy RK45
 │   └── alert_system.py       # Sistema de alertas + exportación JSON
 ├── frontend/
@@ -95,6 +94,7 @@ digital-twin-suspension/
 ├── test_alert2.py
 ├── updater.py                # Lógica de actualización
 └── README.md
+```
 
 ---
 
@@ -176,7 +176,7 @@ Los picos se guardan automáticamente en `picos_vibracion.json`:
 
 ## 📄 Licencia
 
-Este proyecto está bajo la Licencia MIT.
+Licencia MIT - Uso libre para fines educativos.
 
 ---
 
