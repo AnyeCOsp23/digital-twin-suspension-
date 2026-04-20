@@ -446,6 +446,23 @@ scene.add(floor);
         // 3. Ajuste de ambiente (Noche)
         scene.background = new THREE.Color(0x050810);
         scene.fog = new THREE.FogExp2(0x050810, 0.008); // Niebla oscura que oculta el horizonte
+        let guideLine; // Variable global para la línea de referencia
+        const apexHeight = 6.99; // Altura fija para la línea de guía (ajustada dinámicamente luego)
+
+        // --- CONFIGURACIÓN DEL VECTOR (FLECHA) ---
+const dirArrow = new THREE.Vector3(0, -1, 0); 
+const originArrow = new THREE.Vector3(0, 6.99, 2); // Tu punto exacto
+const colorArrow = 0x00FF00; 
+// --- VALOR DE AJUSTE MANUAL ---
+// Si la flecha se queda corta, aumenta este número (ej. 0.1). 
+// Si se pasa y atraviesa el chasis, redúcelo o ponlo en negativo (ej. -0.1).
+const OFFSET_ABAJO = 0.15;
+const OFFSET_ARRIBA = 0.05;
+
+// Creamos el objeto ArrowHelper
+// Parámetros: dirección, origen, longitud inicial, color, tamaño cabeza, ancho cabeza
+const displacementArrow = new THREE.ArrowHelper(dirArrow, originArrow, 0.1, colorArrow, 0.2, 0.2);
+scene.add(displacementArrow);
 
         // --- CAR MODEL ---
         const carGroup = new THREE.Group(); 
@@ -453,7 +470,26 @@ scene.add(floor);
 
         const chassisObj = new THREE.Group(); // Agrupa todo el chasis para moverlo junto
         carGroup.add(chassisObj);
+    // --- LÍNEA DE GUÍA HORIZONTAL SUTIL ---
+    const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-50, 0, 0), // Largo hacia atrás
+    new THREE.Vector3(50, 0, 0)   // Largo hacia adelante
+    ]);
 
+    const lineMaterial = new THREE.LineBasicMaterial({ 
+    color: 0x6f6f6f,      // Amarillo como tu HUD
+    transparent: true, 
+    opacity: 1,        // Muy sutil, casi un fantasma
+    depthWrite: false     // Para que no interfiera con otros objetos
+    });
+
+    guideLine = new THREE.Line(lineGeometry, lineMaterial);
+
+// La posicionamos a una altura fija (el 0 visual del carro)
+// Según tu código, el carro suele estar un poco arriba del suelo.
+// Ajustamos a y=6 que es aproximadamente la parte superior del chasis
+    guideLine.position.set(0, 6.2, 2); 
+    scene.add(guideLine);
         // Variables para las ruedas del modelo .glb
         let realWheels = []; 
         let glbScale = 6.5; // Guardará la escala global para adaptar la física de las llantas
@@ -589,6 +625,43 @@ for (let i = 0; i < stripes; i++) {
                     realWheels.push(pivotGroup); 
                 });
 
+                // ============================================================
+// --- AJUSTE DINÁMICO AL "LÍMITE VERDE" (CHASIS) ---
+// ============================================================
+let chassisMaxY = 0;
+
+// Buscamos específicamente las mallas que NO sean accesorios (como el escape)
+model.traverse((child) => {
+    if (child.isMesh) {
+        const name = child.name.toLowerCase();
+        // Filtramos: si no es el escape o partes negras altas, lo medimos
+        // Usualmente el chasis tiene nombres como 'body', 'chassis', o simplemente no contiene 'exhaust'
+        if (!name.includes('exhaust') && !name.includes('pipe') && !name.includes('smoke')) {
+            const meshBox = new THREE.Box3().setFromObject(child);
+            if (meshBox.max.y > chassisMaxY) {
+                chassisMaxY = meshBox.max.y;
+            }
+        }
+    }
+});
+
+// Si por alguna razón el filtro no encuentra nada, usamos un fallback
+if (chassisMaxY === 0) {
+    const backupBox = new THREE.Box3().setFromObject(chassisObj);
+    chassisMaxY = backupBox.max.y * 0.85; // Estimación: 85% de la altura total
+}
+
+if (guideLine) {
+    // Aplicamos la altura encontrada
+    guideLine.position.y = chassisMaxY; 
+}
+// ============================================================
+
+                if (guideLine) {
+                    guideLine.position.y = apexHeight; // <--- Ajustamos la línea a esa altura exacta
+                }
+                // ============================================================
+
             }, function (error) {
                 console.error("Error cargando .glb:", error);
             });
@@ -669,6 +742,33 @@ for (let i = 0; i < stripes; i++) {
             }
 
             chassisObj.position.y = chY; // Movemos la carrocería exclusivamente
+          // --- ACTUALIZACIÓN DINÁMICA DEL VECTOR ---
+if (displacementArrow) {
+    // 1. Calculamos cuánto se alejó el carro del punto 6.99
+    // chY ya es la diferencia (Posición_Actual - 6.99)
+    const distancia = Math.abs(chY);
+
+    // 2. LÓGICA DE DIRECCIÓN SOLICITADA:
+    // Si chY es negativo (< 0), el carro está ABAJO -> Flecha apunta ABAJO (0, -1, 0)
+    // Si chY es positivo (> 0), el carro está ARRIBA -> Flecha apunta ARRIBA (0, 1, 0)
+    const ejeY = (chY < 0) ? -1 : 1;
+    displacementArrow.setDirection(new THREE.Vector3(0, ejeY, 0));
+
+    // 3. AJUSTE DE LONGITUD CON OFFSET
+    // Usamos tus valores de calibración
+    const ajusteManual = (chY < 0) ? OFFSET_ABAJO : OFFSET_ARRIBA;
+    const longitudFinal = Math.max(0, distancia + ajusteManual);
+
+    displacementArrow.setLength(longitudFinal, 0.2, 0.15);
+
+    // 4. COLOR Y VISIBILIDAD
+    let t = Math.min(distancia / 0.4, 1.0);
+    displacementArrow.setColor(new THREE.Color(t < 0.5 ? t * 2 : 1.0, t < 0.5 ? 1.0 : 1.0 - (t - 0.5) * 2, 0));
+    
+    // Solo mostramos la flecha si hay un movimiento real
+    displacementArrow.visible = distancia > 0.02;
+}
+
             
             // 3. Efecto de Avance (Suelo, Ciudad y Baches)
             grid.position.x = -(absoluteT * SPEED) % 15;
